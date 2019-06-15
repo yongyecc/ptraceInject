@@ -515,3 +515,136 @@ int inject_remote_process(pid_t pid, char *LibPath, char *FunctionName, long *Fu
 
     return 0;
 }
+
+/*************************************************
+  Description:    通过shellcode方式ptrace注入so模块到远程进程中
+  Input:          pid表示远程进程的ID，LibPath为被远程注入的so模块路径，FunctionName为远程注入的模块后调用的函数
+				  FuncParameter指向被远程调用函数的参数（若传递字符串，需要先将字符串写入到远程进程空间中），NumParameter为参数的个数
+  Output:         无
+  Return:         返回0表示注入成功，返回-1表示失败
+  Others:         无
+*************************************************/ 
+int inject_remote_process_shellcode(pid_t pid, char *LibPath, char *FunctionName, long *FuncParameter, long NumParameter)
+{
+	int iRet = -1;
+	struct pt_regs CurrentRegs, OriginalRegs;  // CurrentRegs表示远程进程中当前的寄存器值，OriginalRegs存储注入前的寄存器值，方便恢复
+	void *mmap_addr, *dlopen_addr, *dlsym_addr, *dlclose_addr, *dlerror_addr;   // 远程进程中需要调用函数的地址
+	void *RemoteMapMemoryAddr, *RemoteModuleAddr, *RemoteModuleFuncAddr; // RemoteMapMemoryAddr为远程进程空间中映射的内存基址，RemoteModuleAddr为远程注入的so模块加载基址，RemoteModuleFuncAddr为注入模块中需要调用的函数地址
+	long parameters[10];  
+	int i;
+	
+	uint8_t *dlopen_param1_ptr, *dlsym_param2_ptr, *saved_r0_pc_ptr, *inject_param_ptr, *remote_code_start_ptr, *local_code_start_ptr, *local_code_end_ptr;
+	
+	extern uint32_t _dlopen_addr_s, _dlopen_param1_s, _dlopen_param2_s, _dlsym_addr_s, \
+			_dlsym_param2_s, _dlclose_addr_s, _inject_start_s, _inject_end_s, _inject_function_param_s, \
+			_saved_cpsr_s, _saved_r0_pc_s;	
+			
+	uint32_t code_length;
+	
+	// Attach远程进程
+	if (ptrace_attach(pid) == -1)
+		return iRet;
+	
+	// 获取远程进程的寄存器值
+	if (ptrace_getregs(pid, &CurrentRegs) == -1)
+	{
+		ptrace_detach(pid);
+		return iRet;
+	}
+	
+	LOGD("ARM_r0:0x%lx, ARM_r1:0x%lx, ARM_r2:0x%lx, ARM_r3:0x%lx, ARM_r4:0x%lx, ARM_r5:0x%lx, ARM_r6:0x%lx, ARM_r7:0x%lx, ARM_r8:0x%lx, ARM_r9:0x%lx, ARM_r10:0x%lx, ARM_ip:0x%lx, ARM_sp:0x%lx, ARM_lr:0x%lx, ARM_pc:0x%lx", \
+		CurrentRegs.ARM_r0, CurrentRegs.ARM_r1, CurrentRegs.ARM_r2, CurrentRegs.ARM_r3, CurrentRegs.ARM_r4, CurrentRegs.ARM_r5, CurrentRegs.ARM_r6, CurrentRegs.ARM_r7, CurrentRegs.ARM_r8, CurrentRegs.ARM_r9, CurrentRegs.ARM_r10, CurrentRegs.ARM_ip, CurrentRegs.ARM_sp, CurrentRegs.ARM_lr, CurrentRegs.ARM_pc);
+	
+	// 保存远程进程空间中当前的上下文寄存器环境
+	memcpy(&OriginalRegs, &CurrentRegs, sizeof(CurrentRegs)); 
+	
+	// 获取mmap函数在远程进程中的地址
+	mmap_addr = GetRemoteFuncAddr(pid, libc_path, (void *)mmap);
+	LOGD("mmap RemoteFuncAddr:0x%lx", (long)mmap_addr);
+	
+	// 设置mmap的参数
+	// void *mmap(void *start, size_t length, int prot, int flags, int fd, off_t offsize);
+    parameters[0] = 0;  // 设置为NULL表示让系统自动选择分配内存的地址    
+    parameters[1] = 0x4000; // 映射内存的大小    
+    parameters[2] = PROT_READ | PROT_WRITE | PROT_EXEC;  // 表示映射内存区域可读可写可执行   
+    parameters[3] =  MAP_ANONYMOUS | MAP_PRIVATE; // 建立匿名映射    
+    parameters[4] = 0; //  若需要映射文件到内存中，则为文件的fd  
+    parameters[5] = 0; //文件映射偏移量 	
+	
+	// 调用远程进程的mmap函数，建立远程进程的内存映射
+	if (ptrace_call(pid, (long)mmap_addr, parameters, 6, &CurrentRegs) == -1)
+	{
+		LOGD("Call Remote mmap Func Failed");
+		ptrace_detach(pid);
+		return iRet;
+	}
+	
+	// 获取mmap函数执行后的返回值，也就是内存映射的起始地址
+	RemoteMapMemoryAddr = (void *)ptrace_getret(&CurrentRegs);
+	LOGD("Remote Process Map Memory Addr:0x%lx", (long)RemoteMapMemoryAddr);
+	
+	// 分别获取dlopen、dlsym、dlclose等函数的地址
+	dlopen_addr = GetRemoteFuncAddr(pid, linker_path, (void *)dlopen);
+	dlsym_addr = GetRemoteFuncAddr(pid, linker_path, (void *)dlsym);
+	dlclose_addr = GetRemoteFuncAddr(pid, linker_path, (void *)dlclose);
+	dlerror_addr = GetRemoteFuncAddr(pid, linker_path, (void *)dlerror);
+	
+	LOGD("dlopen RemoteFuncAddr:0x%lx", (long)dlopen_addr);
+	LOGD("dlsym RemoteFuncAddr:0x%lx", (long)dlsym_addr);
+	LOGD("dlclose RemoteFuncAddr:0x%lx", (long)dlclose_addr);
+	LOGD("dlerror RemoteFuncAddr:0x%lx", (long)dlerror_addr);	
+
+	remote_code_start_ptr = RemoteMapMemoryAddr;// + 0x1000; //+ 0x3C00;    // 远程进程中存放shellcode代码的起始地址
+	local_code_start_ptr = (uint8_t *)&_inject_start_s;     // 本地进程中shellcode的起始地址
+	local_code_end_ptr = (uint8_t *)&_inject_end_s;          // 本地进程中shellcode的结束地址
+
+	_dlopen_addr_s = (uint32_t)dlopen_addr;
+	_dlsym_addr_s = (uint32_t)dlsym_addr;
+	_dlclose_addr_s = (uint32_t)dlclose_addr;
+
+	LOGD("Inject Code Start:0x%x, end:0x%x", (int)local_code_start_ptr, (int)local_code_end_ptr);
+	
+	// 计算shellcode中一些变量的存放起始地址
+	code_length = (uint32_t)&_inject_end_s - (uint32_t)&_inject_start_s;
+	LOGD("Inject Code length: %d", code_length);
+	dlopen_param1_ptr = local_code_start_ptr + code_length;// + 0x20;
+	LOGD("local dlopen first parameter addr is 0x%x", dlopen_param1_ptr);
+	dlsym_param2_ptr = dlopen_param1_ptr + MAX_PATH;
+	LOGD("local dlsym second parameter addr is 0x%x", dlsym_param2_ptr);
+	saved_r0_pc_ptr = dlsym_param2_ptr + MAX_PATH;
+	inject_param_ptr = saved_r0_pc_ptr + MAX_PATH;
+
+	// 写入dlopen的参数LibPath
+	strcpy( dlopen_param1_ptr, LibPath );
+	_dlopen_param1_s = REMOTE_ADDR( dlopen_param1_ptr, local_code_start_ptr, remote_code_start_ptr );
+	LOGD("Remote dlopen first parameter addr is 0x%x", _dlopen_param1_s);
+
+	// 写入dlsym的第二个参数，需要调用的函数名称
+	strcpy( dlsym_param2_ptr, FunctionName );
+	_dlsym_param2_s = REMOTE_ADDR( dlsym_param2_ptr, local_code_start_ptr, remote_code_start_ptr );
+	LOGD("Remote dlsym second parameter addr is 0x%x", _dlsym_param2_s);
+
+	//保存cpsr寄存器
+	_saved_cpsr_s = OriginalRegs.ARM_cpsr;
+
+	//保存r0-pc寄存器
+	memcpy( saved_r0_pc_ptr, &(OriginalRegs.ARM_r0), 16 * 4 ); // r0 ~ r15
+	_saved_r0_pc_s = REMOTE_ADDR( saved_r0_pc_ptr, local_code_start_ptr, remote_code_start_ptr );
+	LOGD("Remote r0-pc registers addr is 0x%x", _saved_r0_pc_s);
+
+	memcpy( inject_param_ptr, FuncParameter, NumParameter );
+	_inject_function_param_s = REMOTE_ADDR( inject_param_ptr, local_code_start_ptr, remote_code_start_ptr );
+	LOGD("My fuction parameter addr is 0x%x", _inject_function_param_s);
+
+	ptrace_writedata( pid, remote_code_start_ptr, local_code_start_ptr, 0x400 );
+	LOGD("wriate data complete");
+
+	memcpy( &CurrentRegs, &OriginalRegs, sizeof(CurrentRegs) );
+	LOGD("cpoy register addr complete");
+	// CurrentRegs.ARM_sp = (long)remote_code_start_ptr;
+	CurrentRegs.ARM_pc = (long)remote_code_start_ptr;
+	ptrace_setregs( pid, &CurrentRegs );
+	LOGD("set register addr complete");
+	ptrace_detach( pid );
+	LOGD("injected complete");
+	return 0;
